@@ -11,10 +11,15 @@
 #include <vector>
 #include <poll.h>
 
-#define MAX_MSG_SIZE = 32 << 20;
+#define MAX_MSG_SIZE  32 << 20
 
 using namespace std;
 
+
+/*
+protocol:
+4 bytes message length + 'len' bytes message +...repeat
+*/
 
 void errorHandler(const char* msg)
 {
@@ -63,9 +68,49 @@ struct conn{
 };
 
 
-void consume_buffer(vector<uint8_t>& buff, size_t n) {};
-bool try_once(conn* curr) {};
-void append_buffer(vector<uint8_t>& buff, uint8_t* temp, size_t n) {};
+void consume_buffer(vector<uint8_t>& buff, size_t n) 
+{
+    buff.erase(buff.begin(), buff.begin()+n);
+    return;
+}
+
+
+
+void append_buffer(vector<uint8_t>& buff, uint8_t* from, size_t n) 
+{
+    buff.insert(buff.end(), from, from+n);
+    return;
+}
+
+bool try_once(conn* curr) 
+{
+    if(curr->incomingBuff.size()<4) return false;
+
+    uint32_t len=0;
+    memcpy(&len, curr->incomingBuff.data(), 4);
+
+
+    if(len>MAX_MSG_SIZE) 
+    {
+        curr->want_to_close=true;
+        errorHandler("msg size too large");
+        return false;
+    }
+
+    if(len+4 > curr->incomingBuff.size()) return false;
+
+    uint8_t* request=&curr->incomingBuff[4];
+    cout<<"client says: " <<request<<endl;
+
+
+    //echo 
+    append_buffer(curr->outgoingBuff, (uint8_t *)&len, 4);
+    append_buffer(curr->outgoingBuff, request, len);
+
+    consume_buffer(curr->incomingBuff, 4+len);
+    return true;
+
+}
 
 
 conn* handle_accept(int fd) 
@@ -91,6 +136,25 @@ conn* handle_accept(int fd)
     return curr;
 }
 
+void handle_write(conn* curr) 
+{
+    ssize_t ret = write(curr->fd, &curr->outgoingBuff[0], curr->outgoingBuff.size());
+
+    if(ret<0)
+    {
+        curr->want_to_close=true;
+        errorHandler("write()");
+    }
+
+    consume_buffer(curr->outgoingBuff, (size_t)ret);
+
+    if(curr->outgoingBuff.size()==0)
+    {
+        curr->want_to_read=true;
+        curr->want_to_write=false;
+    }
+    return;
+}
 
 void handle_read(conn* curr) 
 {
@@ -126,27 +190,6 @@ void handle_read(conn* curr)
     return;
 }
 
-
-
-void handle_write(conn* curr) 
-{
-    ssize_t ret = write(curr->fd, &curr->outgoingBuff[0], curr->outgoingBuff.size());
-
-    if(ret<0)
-    {
-        curr->want_to_close=true;
-        errorHandler("write()");
-    }
-
-    consume_buffer(curr->outgoingBuff, (size_t)ret);
-
-    if(curr->outgoingBuff.size()==0)
-    {
-        curr->want_to_read=true;
-        curr->want_to_write=false;
-    }
-    return;
-}
 
 
 
