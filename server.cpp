@@ -8,6 +8,10 @@
 #include <netinet/ip.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <vector>
+#include <poll.h>
+
+#define MAX_MSG_SIZE = 32 << 20;
 
 using namespace std;
 
@@ -39,6 +43,113 @@ void handleConn(int connfd)
     return;
 }
 
+void setFdNonBlocking(int fd)
+{
+    int flags=fcntl(fd, F_GETFL, 0);
+    flags |= O_NONBLOCK;
+
+    fcntl(fd, F_SETFL, flags);
+
+    return;
+}
+
+struct conn{
+    int fd=-1;
+    bool want_to_read=false;
+    bool want_to_write=false;
+    bool want_to_close=false;
+    vector<uint8_t> incomingBuff;
+    vector<uint8_t> outgoingBuff;
+};
+
+
+void consume_buffer(vector<uint8_t>& buff, size_t n) {};
+bool try_once(conn* curr) {};
+void append_buffer(vector<uint8_t>& buff, uint8_t* temp, size_t n) {};
+
+
+conn* handle_accept(int fd) 
+{
+    struct sockaddr_in client_info ={};
+    socklen_t addrlen=sizeof(client_info);
+    int connfd=accept(fd, (struct sockaddr*)&client_info, &addrlen);
+
+    if(connfd<0)
+    {
+        errorHandler("accept()");
+        return NULL;
+    }
+
+    uint32_t ip=client_info.sin_addr.s_addr;
+    cerr<<"client connected from: "<<ip<<": "<<ntohs(client_info.sin_port)<<endl;
+
+    setFdNonBlocking(connfd);
+    conn* curr=new conn();
+    curr->fd=connfd;
+    curr->want_to_read=true;
+
+    return curr;
+}
+
+
+void handle_read(conn* curr) 
+{
+    uint8_t buff[1<<16];
+    ssize_t ret=read(curr->fd, buff, sizeof(buff));
+
+    if(ret<0)
+    {
+        curr->want_to_close=true;
+        errorHandler("read()");
+    }
+
+    if(ret==0)
+    {
+        //handle EOF
+    }
+
+    append_buffer(curr->incomingBuff, buff, ret);
+
+    
+
+    //parsing requests with pipelining
+    while(try_once(curr)) {};
+
+    if(curr->outgoingBuff.size())
+    {
+        // response ready
+        curr->want_to_write=true;
+        curr->want_to_read=false;
+        return handle_write(curr);
+    }
+
+    return;
+}
+
+
+
+void handle_write(conn* curr) 
+{
+    ssize_t ret = write(curr->fd, &curr->outgoingBuff[0], curr->outgoingBuff.size());
+
+    if(ret<0)
+    {
+        curr->want_to_close=true;
+        errorHandler("write()");
+    }
+
+    consume_buffer(curr->outgoingBuff, (size_t)ret);
+
+    if(curr->outgoingBuff.size()==0)
+    {
+        curr->want_to_read=true;
+        curr->want_to_write=false;
+    }
+    return;
+}
+
+
+
 
 
 
@@ -67,25 +178,79 @@ int main()
         errorHandler("bind error");
     }
 
+    setFdNonBlocking(fd); //non blocking listening socket
 
-    ret=listen(fd, SOMAXCONN);
-    if(ret)
-    {
-        errorHandler("listen error");
-    }
+
+    vector<conn*> fd2conn_mp;
+    vector<struct pollfd> poll_args;
+
+
 
     //event loop
     while(true)
     {
-        struct sockaddr_in client_info = {};
-        socklen_t addrlen = sizeof(client_info);
+        poll_args.clear();
+        struct pollfd pfd={fd, POLLIN, 0};
+        poll_args.push_back(pfd);
+        for(conn *curr : fd2conn_mp)
+        {
+            if(!curr) continue;
+            struct pollfd pfd={curr->fd, POLLERR, 0};
+            if(curr->want_to_read)
+            {
+                pfd.events |= POLLIN;
+            }
+            if(curr->want_to_write)
+            {
+                pfd.events |= POLLOUT;
+            }
+            poll_args.push_back(pfd);
+        }
 
-        int connfd = accept(fd, (struct sockaddr* )&client_info, &addrlen);
+        int ret=poll(poll_args.data(), poll_args.size(), -1); //indefinite waiting mode
+        if(ret<0)
+        {
+            errorHandler("poll()");
+        }
 
-        if(connfd<0) continue;
+        // listening socket setup
+        if(poll_args[0].revents)
+        {
+            if(conn* curr=handle_accept(fd))
+            {
+                if(fd2conn_mp.size() <= curr->fd)
+                {
+                    fd2conn_mp.resize(fd2conn_mp.size() + 100);
+                }
+                fd2conn_mp[curr->fd]=curr;
+            }
+        }
 
-        handleConn(connfd);
-        close(connfd);
+        // connection sockets handling
+
+        for(int j=1;j<poll_args.size();j++)
+        {
+            uint32_t is_ready=poll_args[j].revents;
+            if(!is_ready) continue;
+
+            conn* curr=fd2conn_mp[poll_args[j].fd];
+
+            if(is_ready & POLLIN)
+            {
+                handle_read(curr);
+            }
+            if(is_ready & POLLOUT)
+            {
+                handle_write(curr);
+            }
+
+            if(is_ready & POLLERR || curr->want_to_close)
+            {
+                close(curr->fd);
+                fd2conn_mp[curr->fd]=NULL;
+                delete curr;
+            }   
+        }
     }
 
 
