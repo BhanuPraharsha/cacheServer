@@ -54,8 +54,40 @@ hash_node* ht_detach(hash_table* htab, hash_node** target)
 
 
 
-void hm_reshashing_helper(hash_map* hmap) {};
-void trigger_rehashing(hash_map* hmap) {};
+void hm_reshashing_helper(hash_map* hmap) 
+{
+    size_t it=0;
+    while(it<rehashing_constant && hmap->older.size>0)
+    {
+        hash_node** curr=&hmap->older.tab[hmap->migration_offset];
+        if(!*curr)
+        {
+            hmap->migration_offset ++;
+            continue;
+        }
+        ht_insert(&hmap->newer, ht_detach(&hmap->older, curr));
+        it++;
+    }
+
+    if(hmap->older.size == 0 && hmap->older.tab)
+    {
+        free(hmap->older.tab);
+        hmap->older=hash_table();
+    }
+
+    return;
+}
+
+
+
+void trigger_rehashing(hash_map* hmap) 
+{
+    assert(hmap->older.tab == NULL);
+    hmap->older=hmap->newer;
+    ht_init(&hmap->newer, 2*(hmap->newer.mask + 1));
+    hmap->migration_offset=0;
+    return;
+}
 
 hash_node* hm_lookup(hash_map* hmap, hash_node* key, bool(*equal_func)(hash_node* a, hash_node* b))
 {
