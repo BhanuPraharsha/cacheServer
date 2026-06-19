@@ -11,8 +11,9 @@
 #include <vector>
 #include <poll.h>
 #include <map>
+#include "hashtable.h"
 
-#define MAX_MSG_SIZE  32 << 20
+#define MAX_MSG_SIZE  (32 << 20)
 
 using namespace std;
 
@@ -22,9 +23,15 @@ message protocol:
 number_of_arguments + 4 bytes message length + 'len' bytes message +...number_of_arguments times
 */
 
+enum{
+    RES_OK = 0, 
+    RES_ERR = 1, //error
+    RES_NF =  2, //key not found
+};
+
 struct response 
 {
-    uint32_t status;
+    uint32_t status=RES_OK;
     vector<uint8_t> data;
 };
 
@@ -34,14 +41,28 @@ status code + data
 */
 
 
-enum{
-    RES_OK = 0, 
-    RES_ERR = 1, //error
-    RES_NF =  2, //key not found
+#define container_of(ptr, type, member) \
+    ((type* )((char*)ptr - offsetof(type, member))) // to get back the pointer to the parent struct, from the intrusive structure 'member'
+
+ 
+struct{ //global k-v storage
+    hash_map db;
+} g_map;
+
+struct entry{
+    struct hash_node node;
+    string key;
+    string val;
 };
 
+bool equal_func(hash_node* a, hash_node* b)
+{
+    struct entry* e1=container_of(a, entry, node);
+    struct entry* e2=container_of(b, entry, node);
 
-map<string, string> g_map; //global k-v storage
+    return e1->key == e2->key;
+}
+
 
 void errorHandler(const char* msg)
 {
@@ -89,6 +110,17 @@ void append_buffer(vector<uint8_t>& buff, uint8_t* from, size_t n)
     return;
 }
 
+uint64_t str_hash(uint8_t* str, size_t len)
+{
+    //FNV string hash function
+     uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++)
+    {
+        h = (h + str[i]) * 0x01000193;
+    }
+    return h;
+}
+
 
 int parse_request(uint8_t *in, size_t n, vector<string>& out) //parsing the execution commands from the message stream
 {
@@ -115,27 +147,79 @@ int parse_request(uint8_t *in, size_t n, vector<string>& out) //parsing the exec
 }
 
 
+void GET(vector<string>& cmd, response& resp) 
+{
+    entry key;
+    key.key=cmd[1];
+    key.node.hash=str_hash((uint8_t*)(key.key.data()), key.key.size());
+
+    hash_node* target=hm_lookup(&g_map.db, &key.node, equal_func);
+
+    if(target)
+    {
+        string& val=container_of(target, entry, node)->val;
+        resp.data.assign(val.begin(), val.end());
+    }
+    else{
+        resp.status=RES_NF;
+    }
+
+    return;
+}
+
+
+
+void SET(vector<string>& cmd, response& resp) 
+{
+    entry key;
+    key.key=cmd[1];
+    key.node.hash=str_hash((uint8_t*)(key.key.data()), key.key.size());
+    
+    hash_node* target=hm_lookup(&g_map.db, &key.node, equal_func);
+
+    if(target)
+    {
+        container_of(target, entry, node)->val = cmd[2];
+    }
+    else{
+        entry *curr =new entry();
+        curr->node.hash = key.node.hash;
+        curr->key=cmd[1];
+        curr->val=cmd[2];
+        hm_insert(&g_map.db, &curr->node);
+    }
+
+    return;
+}
+
+
+void DEL(vector<string>& cmd, response& resp) 
+{
+    entry key;
+    key.key=cmd[1];
+    key.node.hash=str_hash((uint8_t*)(key.key.data()), key.key.size());
+
+    hash_node* todelete=hm_delete(&g_map.db, &key.node, equal_func);
+    if(todelete!=NULL) delete container_of(todelete, entry, node);
+
+    return;
+}
+
+
+
 void resolve_request(vector<string>& cmd, response &out) //execution of the commands
 {
     if(cmd.size()==2 && cmd[0]=="GET")
     {
-        auto it=g_map.find(cmd[1]);
-        if(it==g_map.end())
-        {
-            out.status==RES_NF;
-            return;
-        }
-
-        out.data.assign(it->second.begin(), it->second.end());
-
+        return GET(cmd, out);
     }
     else if(cmd.size()==3 && cmd[0]=="SET") 
     {
-        g_map[cmd[1]]=cmd[2];
+        return SET(cmd, out);
     }
-    else if(cmd.size()==2 & cmd[0]=="DEL")
+    else if(cmd.size()==2 && cmd[0]=="DEL")
     {
-        g_map.erase(cmd[1]);
+        return DEL(cmd, out);
     }
     else{
         out.status=RES_ERR;
@@ -156,25 +240,6 @@ void make_response(response &resp, vector<uint8_t> &out) // serialise the respon
 }
 
 
-
-void handleConn(int connfd)
-{
-    char buff[64]={};
-    ssize_t n=read(connfd, buff, sizeof(buff)-1);
-
-    if(n<0)
-    {
-        errorHandler("read errorHandler");
-        return;
-    }
-
-    cout<<"client says: "<<buff<<endl;
-
-    char retbuff[]="world!!";
-    write(connfd, retbuff, strlen(retbuff));
-
-    return;
-}
 
 void setFdNonBlocking(int fd)
 {
@@ -226,7 +291,7 @@ bool try_once(conn* curr)
     response resp;
     resolve_request(cmd, resp);
     make_response(resp, curr->outgoingBuff);
-    consume_buffer(curr->outgoingBuff, 4+len);
+    consume_buffer(curr->incomingBuff, 4+len);
 
     return true;
 }
@@ -288,7 +353,9 @@ void handle_read(conn* curr)
 
     if(ret==0)
     {
-        //handle EOF
+        // handle EOF, which occurs when client disconnects abruptly
+        curr->want_to_close=true;
+        return;
     }
 
     append_buffer(curr->incomingBuff, buff, ret);
@@ -341,6 +408,9 @@ int main()
     }
 
     setFdNonBlocking(fd); //non blocking listening socket
+
+    ret=listen(fd, SOMAXCONN);
+    if(ret) errorHandler("listen()");
 
 
     vector<conn*> fd2conn_mp;
