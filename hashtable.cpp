@@ -8,7 +8,7 @@ const size_t load_factor = 8;
 
 void ht_init(hash_table* htab, size_t n)
 {
-    assert(n && n&(n-1)==0);
+    assert(n>0 && (n&(n-1))==0);
 
     htab->mask = n-1;
     htab->size=0;
@@ -123,8 +123,7 @@ void hm_insert(hash_map* hmap, hash_node* node)
 
 hash_node* hm_delete(hash_map* hmap, hash_node* key, bool(*equal_func)(hash_node* a, hash_node* b))
 {
-    trigger_rehashing(hmap);
-
+    hm_reshashing_helper(hmap);
     hash_node** target=ht_lookup(&hmap->newer, key, equal_func);
     if(target!=NULL)  return ht_detach(&hmap->newer, target);
 
