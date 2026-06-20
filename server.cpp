@@ -4,16 +4,20 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <vector>
 #include <poll.h>
-#include <map>
+#include <errno.h>
 #include "hashtable.h"
 
 #define MAX_MSG_SIZE  (32 << 20)
+#define MAX_EVENTS 4096
+
+int epoll_fd;
 
 using namespace std;
 
@@ -261,6 +265,20 @@ struct conn{
 };
 
 
+void update_epoll_events(conn* curr)
+{
+    struct epoll_event ev={};
+    ev.events=EPOLLERR;
+    if(curr->want_to_read) ev.events |= EPOLLIN;
+    if(curr->want_to_write) ev.events |= EPOLLOUT;
+    ev.data.fd=curr->fd;
+
+    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, curr->fd, &ev);
+    return;
+}
+
+
+
 bool try_once(conn* curr) 
 {
     if(curr->incomingBuff.size()<4) return false;
@@ -272,7 +290,7 @@ bool try_once(conn* curr)
     if(len>MAX_MSG_SIZE) 
     {
         curr->want_to_close=true;
-        errorHandler("msg size too large");
+        msg_error("msg size too large");
         return false;
     }
 
@@ -297,7 +315,7 @@ bool try_once(conn* curr)
 }
 
 
-conn* handle_accept(int fd) 
+conn* handle_accept(int fd, vector<conn*>& fd2conn_mp) 
 {
     struct sockaddr_in client_info ={};
     socklen_t addrlen=sizeof(client_info);
@@ -317,6 +335,19 @@ conn* handle_accept(int fd)
     curr->fd=connfd;
     curr->want_to_read=true;
 
+
+    if((size_t)connfd >= fd2conn_mp.size())
+    {
+        fd2conn_mp.resize(connfd+100, NULL);
+    }
+
+    fd2conn_mp[connfd]=curr;
+
+    struct epoll_event ev={};
+    ev.events = EPOLLIN | EPOLLERR;
+    ev.data.fd=connfd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd, &ev);
+
     return curr;
 }
 
@@ -326,8 +357,9 @@ void handle_write(conn* curr)
 
     if(ret<0)
     {
+        if(errno == EAGAIN || errno == EWOULDBLOCK) return;
         curr->want_to_close=true;
-        errorHandler("write()");
+        return;
     }
 
     consume_buffer(curr->outgoingBuff, (size_t)ret);
@@ -347,8 +379,9 @@ void handle_read(conn* curr)
 
     if(ret<0)
     {
+        if(errno == EAGAIN || errno == EWOULDBLOCK) return;
         curr->want_to_close=true;
-        errorHandler("read()");
+        return;
     }
 
     if(ret==0)
@@ -370,7 +403,12 @@ void handle_read(conn* curr)
         // response ready
         curr->want_to_write=true;
         curr->want_to_read=false;
-        return handle_write(curr);
+        handle_write(curr);
+
+        if(curr->outgoingBuff.size())
+        {
+            update_epoll_events(curr); //update epoll so that it looks out for EPOLL_OUT
+        }
     }
 
     return;
@@ -409,79 +447,72 @@ int main()
 
     setFdNonBlocking(fd); //non blocking listening socket
 
-    ret=listen(fd, SOMAXCONN);
-    if(ret) errorHandler("listen()");
+    epoll_fd=epoll_create1(0);
+
+    if(epoll_fd < 0)
+    {
+        errorHandler("epoll_create1()");
+    }
+
+    struct epoll_event listen_ev={};
+    listen_ev.events=EPOLLIN;
+    listen_ev.data.fd=fd;
+
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &listen_ev);
 
 
     vector<conn*> fd2conn_mp;
-    vector<struct pollfd> poll_args;
-
+    struct epoll_event events[MAX_EVENTS];
 
 
     //event loop
     while(true)
     {
-        poll_args.clear();
-        struct pollfd pfd={fd, POLLIN, 0};
-        poll_args.push_back(pfd);
-        for(conn *curr : fd2conn_mp)
-        {
-            if(!curr) continue;
-            struct pollfd pfd={curr->fd, POLLERR, 0};
-            if(curr->want_to_read)
-            {
-                pfd.events |= POLLIN;
-            }
-            if(curr->want_to_write)
-            {
-                pfd.events |= POLLOUT;
-            }
-            poll_args.push_back(pfd);
-        }
+        int n_ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
-        int ret=poll(poll_args.data(), poll_args.size(), -1); //indefinite waiting mode
-        if(ret<0)
+        if(n_ready < 0) 
         {
-            errorHandler("poll()");
-        }
-
-        // listening socket setup
-        if(poll_args[0].revents)
-        {
-            if(conn* curr=handle_accept(fd))
-            {
-                if(fd2conn_mp.size() <= curr->fd)
-                {
-                    fd2conn_mp.resize(fd2conn_mp.size() + 100);
-                }
-                fd2conn_mp[curr->fd]=curr;
-            }
+            errorHandler("epoll_wait()");
         }
 
         // connection sockets handling
-
-        for(int j=1;j<poll_args.size();j++)
+        for(int j=0;j<n_ready;j++)
         {
-            uint32_t is_ready=poll_args[j].revents;
-            if(!is_ready) continue;
+            int curr_fd=events[j].data.fd;
+            uint32_t ev=events[j].events;
 
-            conn* curr=fd2conn_mp[poll_args[j].fd];
+            if(curr_fd == fd)
+            {
+                //listening socket
+                handle_accept(fd, fd2conn_mp);
+                continue;
+            }
 
-            if(is_ready & POLLIN)
+            conn* curr=fd2conn_mp[curr_fd];
+
+            if(!curr) continue;
+
+            if(ev & EPOLLIN)
             {
                 handle_read(curr);
             }
-            if(is_ready & POLLOUT)
+
+            if(ev & EPOLLOUT)
             {
                 handle_write(curr);
+                if(curr->want_to_read && !curr->want_to_write)
+                {
+                    update_epoll_events(curr);
+                }
             }
 
-            if(is_ready & POLLERR || curr->want_to_close)
+            if((ev & EPOLLERR) || (curr->want_to_close))
             {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, curr->fd, NULL);
                 close(curr->fd);
                 fd2conn_mp[curr->fd]=NULL;
                 delete curr;
-            }   
+            }
         }
     }
 
