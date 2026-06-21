@@ -1,0 +1,24 @@
+@startuml
+skinparam BackgroundColor white
+node "Client Machine" {
+    artifact "redis-benchmark" as RedisBench
+}
+
+node "Server Machine (Linux)" {
+    node "Kernel Space" {
+        component "TCP/IP Stack" as TCP
+        component "epoll instance" as EpollK
+    }
+    node "User Space (Single Core)" {
+        component "Cache Server Process" as CacheServer {
+            component "Reactor Loop" as Reactor
+            database "In-Memory Hash Table" as HT
+        }
+    }
+}
+
+RedisBench <--> TCP : Network (Loopback/LAN)
+TCP <--> EpollK : Kernel Buffers
+EpollK <--> Reactor : System Calls (epoll_wait, read, write)
+Reactor --> HT : In-Memory Operations
+@enduml

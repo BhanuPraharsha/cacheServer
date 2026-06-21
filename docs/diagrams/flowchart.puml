@@ -1,0 +1,36 @@
+@startuml
+skinparam BackgroundColor white
+start
+:Initialize epoll;
+:Create Listening Socket;
+:Register Listening Socket (EPOLLIN);
+while (Server Running?) is (yes)
+  :epoll_wait();
+  if (Event on Listening Socket?) then (yes)
+    :accept() new connection;
+    :Set socket NONBLOCK;
+    :Register new socket (EPOLLIN);
+  else (no)
+    if (Event is EPOLLIN?) then (yes)
+      :recv() data;
+      if (Connection Closed/Error?) then (yes)
+        :Close Socket & Cleanup;
+      else (no)
+        :Parse Protocol;
+        :Execute Command;
+        :send() response;
+        if (EAGAIN?) then (yes)
+          :Buffer remaining data;
+          :Modify socket (EPOLLIN | EPOLLOUT);
+        endif
+      endif
+    else if (Event is EPOLLOUT?) then (yes)
+      :send() buffered data;
+      if (All data sent?) then (yes)
+        :Modify socket (EPOLLIN only);
+      endif
+    endif
+  endif
+endwhile (no)
+stop
+@enduml

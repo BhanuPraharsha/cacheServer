@@ -1,0 +1,47 @@
+@startuml
+skinparam componentStyle uml2
+skinparam BackgroundColor white
+
+actor Client as "Client (redis-benchmark)"
+
+package "Cache Server" {
+    component Acceptor [
+        Acceptor
+        (Listening Socket)
+    ]
+    
+    component EpollWait [
+        epoll_wait()
+        (Event Dispatcher)
+    ]
+    
+    component Reader [
+        Fast-Path Reader
+        (User-Space Buffer)
+    ]
+    
+    component Parser [
+        Protocol Parser
+    ]
+    
+    database HashTable [
+        Intrusive Hash Table
+        (Progressive Rehashing)
+    ]
+    
+    component Writer [
+        Stateful Writer
+        (Outgoing Buffer)
+    ]
+}
+
+Client <--> Acceptor : TCP Socket
+Acceptor -right-> EpollWait : Registers EPOLLIN
+EpollWait --> Reader : EPOLLIN (Read Event)
+Reader --> Parser : Raw Bytes
+Parser --> HashTable : O(1) Lookup/Mutate
+HashTable --> Writer : Response Formatted
+Writer --> EpollWait : Registers EPOLLOUT (if EAGAIN)
+EpollWait --> Writer : EPOLLOUT (Write Event)
+Writer --> Client : Flushed via Syscall
+@enduml

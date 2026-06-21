@@ -1,0 +1,25 @@
+@startuml
+skinparam BackgroundColor white
+actor Client
+participant "epoll_wait" as Epoll
+participant "Reader" as Reader
+participant "Parser" as Parser
+database "Hash Table" as HT
+participant "Writer" as Writer
+
+Client -> Epoll : Connects (TCP)
+Epoll -> Client : Accepts Connection (Registers EPOLLIN)
+Client -> Epoll : Sends "SET key val"
+Epoll -> Reader : EPOLLIN triggered
+Reader -> Reader : recv() into user-space buffer
+Reader -> Parser : Parse Binary Protocol
+Parser -> HT : Mutate Hash Table (key, val)
+HT -> Parser : Return Status (OK)
+Parser -> Writer : Prepare Response
+Writer -> Client : send() response bytes
+alt if kernel send buffer is full (EAGAIN)
+    Writer -> Epoll : Registers EPOLLOUT
+    Epoll -> Writer : EPOLLOUT triggered
+    Writer -> Client : send() remaining bytes
+end
+@enduml
